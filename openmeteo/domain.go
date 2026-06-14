@@ -1,77 +1,100 @@
+// Package openmeteo exposes the Open-Meteo weather API as a kit Domain driver.
+//
+// A multi-domain host (ant) enables it with a single blank import:
+//
+//	import _ "github.com/tamnd/openmeteo-cli/openmeteo"
+//
+// The same Domain also builds the standalone openmeteo binary (see cli.NewApp).
 package openmeteo
 
 import (
 	"context"
-	"net/url"
-	"strings"
+	"fmt"
+	"time"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes openmeteo as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/openmeteo-cli/openmeteo"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// openmeteo:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone openmeteo binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the openmeteo driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the openmeteo driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "openmeteo",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "openmeteo",
-			Short:  "A command line for openmeteo.",
-			Long: `A command line for openmeteo.
-
-openmeteo reads public openmeteo data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+			Short:  "Current weather and forecasts from Open-Meteo",
+			Long: `openmeteo fetches current conditions and multi-day daily forecasts
+from the free Open-Meteo API (api.open-meteo.com).
+No API key or registration required.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/openmeteo-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `openmeteo page` and
-	// `ant get openmeteo://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// current: fetch current weather conditions
+	kit.Handle(app, kit.OpMeta{
+		Name:    "current",
+		Group:   "read",
+		Single:  true,
+		Summary: "Fetch current weather conditions for a location",
+	}, currentOp)
 
-	// List op: members of a page, the home of `openmeteo links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// openmeteo://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// forecast: fetch daily forecast
+	kit.Handle(app, kit.OpMeta{
+		Name:    "forecast",
+		Group:   "read",
+		List:    true,
+		Summary: "Fetch daily weather forecast for a location",
+	}, forecastOp)
+
+	// geocode: resolve city name to lat/lon
+	kit.Handle(app, kit.OpMeta{
+		Name:    "geocode",
+		Group:   "read",
+		List:    true,
+		Summary: "Geocode a city name to lat/lon coordinates",
+	}, geocodeOp)
+
+	// weather: current weather by city name (geocodes first)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "weather",
+		Group:   "read",
+		Single:  true,
+		Summary: "Fetch current weather for a city (geocodes automatically)",
+	}, weatherOp)
+
+	// hourly: hourly forecast by city name
+	kit.Handle(app, kit.OpMeta{
+		Name:    "hourly",
+		Group:   "read",
+		List:    true,
+		Summary: "Fetch hourly weather forecast for a city",
+	}, hourlyOp)
+
+	// air: air quality by city name
+	kit.Handle(app, kit.OpMeta{
+		Name:    "air",
+		Group:   "read",
+		Single:  true,
+		Summary: "Fetch current air quality for a city",
+	}, airOp)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +105,169 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type currentInput struct {
+	Lat    float64       `kit:"flag" help:"latitude in decimal degrees"`
+	Lon    float64       `kit:"flag" help:"longitude in decimal degrees"`
+	Delay  time.Duration `kit:"flag,inherit" help:"minimum spacing between requests"`
+	Client *Client       `kit:"inject"`
+}
+
+type forecastInput struct {
+	Lat    float64       `kit:"flag" help:"latitude in decimal degrees"`
+	Lon    float64       `kit:"flag" help:"longitude in decimal degrees"`
+	Days   int           `kit:"flag,inherit" help:"forecast days (1-16)"`
+	Delay  time.Duration `kit:"flag,inherit" help:"minimum spacing between requests"`
+	Client *Client       `kit:"inject"`
+}
+
+type geocodeInput struct {
+	City   string  `kit:"arg" help:"city name to geocode"`
+	Count  int     `kit:"flag" help:"max number of results"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type weatherInput struct {
+	City   string  `kit:"arg" help:"city name"`
+	Client *Client `kit:"inject"`
+}
+
+type hourlyInput struct {
+	City   string  `kit:"arg" help:"city name"`
+	Days   int     `kit:"flag" help:"forecast days (1-16, default 3)"`
+	Client *Client `kit:"inject"`
+}
+
+type airInput struct {
+	City   string  `kit:"arg" help:"city name"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func currentOp(ctx context.Context, in currentInput, emit func(*CurrentWeather) error) error {
+	w, err := in.Client.Current(ctx, in.Lat, in.Lon)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
+	return emit(w)
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+func forecastOp(ctx context.Context, in forecastInput, emit func(DailyForecast) error) error {
+	days := in.Days
+	if days <= 0 {
+		days = 7
+	}
+	items, err := in.Client.Forecast(ctx, in.Lat, in.Lon, days)
 	if err != nil {
 		return mapErr(err)
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, item := range items {
+		if err := emit(item); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full openmeteo.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized openmeteo reference: %q", input)
+func geocodeOp(ctx context.Context, in geocodeInput, emit func(GeoResult) error) error {
+	count := in.Count
+	if count <= 0 {
+		count = 5
 	}
-	return "page", id, nil
+	results, err := in.Client.Geocode(ctx, in.City, count)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, r := range results {
+		if err := emit(r); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+func weatherOp(ctx context.Context, in weatherInput, emit func(*CurrentWeather) error) error {
+	geo, err := in.Client.Geocode(ctx, in.City, 1)
+	if err != nil {
+		return mapErr(err)
+	}
+	if len(geo) == 0 {
+		return fmt.Errorf("city not found: %s", in.City)
+	}
+	w, err := in.Client.Current(ctx, geo[0].Latitude, geo[0].Longitude)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(w)
+}
+
+func hourlyOp(ctx context.Context, in hourlyInput, emit func(HourlySlice) error) error {
+	geo, err := in.Client.Geocode(ctx, in.City, 1)
+	if err != nil {
+		return mapErr(err)
+	}
+	if len(geo) == 0 {
+		return fmt.Errorf("city not found: %s", in.City)
+	}
+	days := in.Days
+	if days <= 0 {
+		days = 3
+	}
+	slices, err := in.Client.HourlyForecast(ctx, geo[0].Latitude, geo[0].Longitude, days)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, s := range slices {
+		if err := emit(s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func airOp(ctx context.Context, in airInput, emit func(AirQuality) error) error {
+	geo, err := in.Client.Geocode(ctx, in.City, 1)
+	if err != nil {
+		return mapErr(err)
+	}
+	if len(geo) == 0 {
+		return fmt.Errorf("city not found: %s", in.City)
+	}
+	aq, err := in.Client.AirQualityAt(ctx, geo[0].Latitude, geo[0].Longitude)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(aq)
+}
+
+// --- Resolver ---
+
+// Classify turns an input into the canonical (type, id).
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	if input == "" {
+		return "", "", errs.Usage("empty openmeteo reference")
+	}
+	return "weather", input, nil
+}
+
+// Locate returns the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "weather":
+		return "https://" + Host + "/v1/forecast?" + id, nil
+	default:
 		return "", errs.Usage("openmeteo has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr converts a library error into the kit error kind.
 func mapErr(err error) error {
 	return err
 }
